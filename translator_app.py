@@ -2,9 +2,10 @@ import os
 import uuid
 import streamlit as st
 from dotenv import load_dotenv
+from urllib.parse import quote, unquote
 from datetime import datetime, timedelta, timezone
 from azure.core.credentials import AzureKeyCredential
-from azure.ai.translation.document import DocumentTranslationClient
+from azure.ai.translation.document import DocumentTranslationClient, DocumentTranslationInput, TranslationTarget
 from azure.storage.blob import BlobServiceClient, ContentSettings, generate_account_sas, ResourceTypes, AccountSasPermissions
 
 load_dotenv()
@@ -26,6 +27,20 @@ class Translator:
         self.SOURCE_URL = f"https://{ACCOUNT_NAME}.blob.core.windows.net/{SRC_CONTAINER}?{self.sas_token}"
         self.TARGET_URL = f"https://{ACCOUNT_NAME}.blob.core.windows.net/{DST_CONTAINER}?{self.sas_token}"
         self.translator = DocumentTranslationClient(ENDPOINT, AzureKeyCredential(KEY))
+        self._wipe_source_container()
+
+    def _safe_blob_name(self, name: str) -> str:
+        return quote(name, safe="~()*!.'-_")
+
+    def _wipe_source_container(self):
+        try:
+            for blob in self.src_client.list_blobs():
+                try:
+                    self.src_client.delete_blob(blob.name)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     #generate ac levl sas token
     def generate_sas(self):
@@ -38,7 +53,7 @@ class Translator:
                 account_key=ACCOUNT_KEY,
                 resource_types=ResourceTypes(object=True, container=True, service=True),
                 permission=AccountSasPermissions(
-                    read=True, write=True, list=True, delete=True, create=True
+                    read=True, write=True, list=True, delete=True, create=True, add=True
                 ),
                 start=start,
                 expiry=expiry,
@@ -51,35 +66,49 @@ class Translator:
         for f in files:
             try:
                 blob_name = f"{uuid.uuid4()}-{f.name}"
-                blob_client = self.src_client.get_blob_client(blob_name)
+                safe_blob_name = self._safe_blob_name(blob_name)
+                blob_client = self.src_client.get_blob_client(safe_blob_name)
 
                 blob_client.upload_blob(
                     f,
                     overwrite=True,
                     content_settings=ContentSettings(content_type=f.type)
                 )
-                uploaded_blob_names.append(blob_name)
+                uploaded_blob_names.append(safe_blob_name)
 
             except Exception as e:
                 st.error(f"Upload failed for {f.name}: {e}")
 
         return uploaded_blob_names
 
-    def translate(self, target_language="en"):
+    def translate(self, target_lan="en"):
         try:
             return self.translator.begin_translation(
                 self.SOURCE_URL,
                 self.TARGET_URL,
-                target_language
+                target_language= target_lan
             )
         except Exception as e:
             raise RuntimeError(f"Translation failed: {e}")
+
 
     def download_translated(self):
         translated_files = []
         for blob in self.dst_client.list_blobs():
             file_bytes = self.dst_client.get_blob_client(blob.name).download_blob().readall()
-            translated_files.append((blob.name, file_bytes))
+
+            decoded = unquote(blob.name)
+            cleaned = "-".join(decoded.split("-")[1:])
+
+            if "." in cleaned:
+                base, ext = cleaned.rsplit(".", 1)
+                final_name = f"{target_language}_{base}_translated.{ext}"
+            else:
+                final_name = f"{target_language}_{cleaned}_translated"
+
+
+            # translated_files.append((blob.name, file_bytes))
+            translated_files.append((final_name, file_bytes))
         return translated_files
 
     #blob lvl cleanup
@@ -297,7 +326,7 @@ st.markdown("""
 }
 </style>
 """, unsafe_allow_html=True)
-
+#
 # --- Clear behavior: wipe state AND cleanup temps (once) ---
 if clear_clicked:
     try:

@@ -63,4 +63,4 @@ jobs:
         with:
           app-name: 'EY-Translator'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_97E50AA7310B45D498A46B42AF48578A }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_94D23B15CE8149DA9F0176B50D4C0000 }}

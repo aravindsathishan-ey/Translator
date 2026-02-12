@@ -1,3 +1,5 @@
+# This is a Streamlit app that allows users to upload documents, translates them using Azure Document Translation, and then download the translated versions. It also tracks translation status in an Azure Table and estimates page counts for various document types.
+
 import os
 import uuid
 import math
@@ -27,7 +29,7 @@ ENDPOINT = os.getenv("AZURE_DOCUMENT_TRANSLATION_ENDPOINT")
 KEY = os.getenv("AZURE_DOCUMENT_TRANSLATION_KEY")
 TABLE_NAME = os.getenv("AZURE_TABLE_NAME", "learningtesttable")
 
-#DOC-CONFIG
+# DOC-CONFIG
 A4_WIDTH_PT = 595
 A4_HEIGHT_PT = 842
 DEFAULT_MARGIN_PT = 72
@@ -359,7 +361,6 @@ class Translator:
 client = Translator()
 
 
-
 # --- LOGOS ---
 
 st.set_page_config(
@@ -400,8 +401,6 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-
-
 
 
 LOGO_URL = "https://th.bing.com/th/id/OIP.Wgr313SqtaL6NaKsDJfihQAAAA?o=7rm=3&rs=1&pid=ImgDetMain&o=7&rm=3"

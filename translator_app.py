@@ -27,7 +27,7 @@ ENDPOINT = os.getenv("AZURE_DOCUMENT_TRANSLATION_ENDPOINT")
 KEY = os.getenv("AZURE_DOCUMENT_TRANSLATION_KEY")
 TABLE_NAME = os.getenv("AZURE_TABLE_NAME", "learningtesttable")
 
-#DOC-CONFIG
+# DOC-CONFIG
 A4_WIDTH_PT = 595
 A4_HEIGHT_PT = 842
 DEFAULT_MARGIN_PT = 72
@@ -250,7 +250,6 @@ class Translator:
 client = Translator()
 
 
-
 # --- LOGOS ---
 
 st.set_page_config(
@@ -291,8 +290,6 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
-
-
 
 
 LOGO_URL = "https://th.bing.com/th/id/OIP.Wgr313SqtaL6NaKsDJfihQAAAA?o=7rm=3&rs=1&pid=ImgDetMain&o=7&rm=3"
@@ -408,23 +405,28 @@ if translate_clicked and uploaded_files:
         extension = "." + filename.split(".")[-1]
         # print("lsdsdsdd",file_bytes)
         page_count = client.page_count(file_bytes, extension)
+        # Pricing: $3 per page, with a minimum of 1 page for very small docs
+        price = (page_count or 0) * 3
         # print("page______count", page_count, extension)
         row_key = str(uuid.uuid4())
         row_keys.append(row_key)
 
         if client.table_client:
-            client.table_client.upsert_entity({
-                "PartitionKey": "files",
-                "RowKey": row_key,
-                "original_name": f.name,
-                "blob_name": blob_name,
-                "file_type": filename.split(".")[-1],
-                "target_language": target_language,
-                "page_count": page_count,
-                "status": "Uploaded",
-                "uploaded_on": datetime.now(timezone.utc).isoformat(),
-                "translated_on": ""
-            })
+            client.table_client.upsert_entity(
+                {
+                    "PartitionKey": "files",
+                    "RowKey": row_key,
+                    "original_name": f.name,
+                    "blob_name": blob_name,
+                    "file_type": filename.split(".")[-1],
+                    "target_language": target_language,
+                    "page_count": page_count,
+                    "price": f"{price} Cent",
+                    "status": "Uploaded",
+                    "uploaded_on": datetime.now(timezone.utc).isoformat(),
+                    "translated_on": "",
+                }
+            )
 
     # st.success(f"Uploaded {len(uploaded_names)} file(s).")
 

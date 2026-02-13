@@ -1,10 +1,21 @@
+# This is a Streamlit app that allows users to upload documents, translates them using Azure Document Translation, and then download the translated versions. It also tracks translation status in an Azure Table and estimates page counts for various document types.
+
 import os
 import uuid
+import math
+import time
+from io import BytesIO
+from PIL import Image
 import streamlit as st
+from docx import Document
+from PyPDF2 import PdfReader
 from dotenv import load_dotenv
+from openpyxl import load_workbook
+from pptx import Presentation
 from urllib.parse import quote, unquote
 from datetime import datetime, timedelta, timezone
-from azure.core.credentials import AzureKeyCredential
+from azure.core.credentials import AzureKeyCredential, AzureNamedKeyCredential
+from azure.data.tables import TableServiceClient, UpdateMode
 from azure.ai.translation.document import DocumentTranslationClient, DocumentTranslationInput, TranslationTarget
 from azure.storage.blob import BlobServiceClient, ContentSettings, generate_account_sas, ResourceTypes, AccountSasPermissions
 
@@ -16,6 +27,20 @@ SRC_CONTAINER = os.getenv("AZURE_SOURCE_CONTAINER", "transtest")
 DST_CONTAINER = os.getenv("AZURE_TARGET_CONTAINER", "transtesttarget")
 ENDPOINT = os.getenv("AZURE_DOCUMENT_TRANSLATION_ENDPOINT")
 KEY = os.getenv("AZURE_DOCUMENT_TRANSLATION_KEY")
+TABLE_NAME = os.getenv("AZURE_TABLE_NAME", "learningtesttable")
+
+# DOC-CONFIG
+A4_WIDTH_PT = 595
+A4_HEIGHT_PT = 842
+DEFAULT_MARGIN_PT = 72
+DEFAULT_FONT_SIZE_PT = 12
+LINE_HEIGHT_FACTOR = 1.2
+AVG_CHARS_PER_LINE = 80          
+PARA_SPACING_LINES = 0.3         
+TABLE_ROW_LINES = 1    
+TABLE_AFTER_SPACING_LINES = 0.5
+HEADER_FOOTER_LINES = 1.0    
+EMU_PER_POINT = 12700
 
 
 class Translator:
@@ -27,20 +52,35 @@ class Translator:
         self.SOURCE_URL = f"https://{ACCOUNT_NAME}.blob.core.windows.net/{SRC_CONTAINER}?{self.sas_token}"
         self.TARGET_URL = f"https://{ACCOUNT_NAME}.blob.core.windows.net/{DST_CONTAINER}?{self.sas_token}"
         self.translator = DocumentTranslationClient(ENDPOINT, AzureKeyCredential(KEY))
-        self._wipe_source_container()
+        self.table_client = self.table_init()
+        self._wipe_container(self.src_client)
+        self._wipe_container(self.dst_client)
 
     def _safe_blob_name(self, name: str) -> str:
         return quote(name, safe="~()*!.'-_")
 
-    def _wipe_source_container(self):
+    def _wipe_container(self, client):
         try:
-            for blob in self.src_client.list_blobs():
+            for blob in client.list_blobs():
                 try:
-                    self.src_client.delete_blob(blob.name)
+                    client.delete_blob(blob.name)
                 except Exception:
                     pass
         except Exception:
             pass
+
+    #blob table init
+    def table_init(self):
+        table_client = None
+        try:
+            table_credential = AzureNamedKeyCredential(ACCOUNT_NAME, ACCOUNT_KEY)
+            table_service = TableServiceClient(
+                        endpoint=f"https://{ACCOUNT_NAME}.table.core.windows.net",
+                        credential=table_credential
+            )
+            return table_service.create_table_if_not_exists(TABLE_NAME)
+        except Exception:
+            return table_client
 
     #generate ac levl sas token
     def generate_sas(self):
@@ -90,7 +130,198 @@ class Translator:
             )
         except Exception as e:
             raise RuntimeError(f"Translation failed: {e}")
+    
+    def page_count(self, file_bytes, extension):
+        try:
+            # print("ccccccccccccccccccccc")
+            ext = extension.lower()
+            if ext == ".pdf":
+                reader = PdfReader(BytesIO(file_bytes))
+                return len(reader.pages)
+            elif ext == ".pptx":
+                prs = Presentation(BytesIO(file_bytes))
+                return len(prs.slides)
+            elif ext == ".docx":
+                from docx import Document
+                return self.estimate_docx_a4_pages(file_bytes)  
+            elif ext == ".txt":
+                return self.estimate_txt_a4_pages(file_bytes)
+            elif ext in [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif"]:
+                with Image.open(BytesIO(file_bytes)) as img:
+                    return getattr(img, "n_frames", 1)
+            elif ext == ".xlsx":
+                # print("ggggggggggggggggg")
+                return self.estimate_excel_a4_pages(file_bytes)
+            else:
+                return None
+        except Exception as e:
+            return None
 
+    
+    def estimate_docx_a4_pages(self, docx_bytes):
+        """
+        Estimate DOCX pages (works with images, tables, paragraphs, manual page breaks).
+        Pure Python: uses height estimation rather than true layout.
+        """
+        doc = Document(BytesIO(docx_bytes))
+        def _has_page_break(paragraph) -> bool:
+            """
+            Detects if a Word paragraph contains a manual page break:
+            looks for <w:br w:type="page"/> anywhere in the paragraph XML.
+            """
+            p = paragraph._element
+            br_elems = p.xpath('.//w:br[@w:type="page"]')
+            return len(br_elems) > 0
+        def _to_points_len(obj) -> float:
+            """
+            Convert python-docx length-like value to points (float) safely.
+            - python-docx Length objects have .pt
+            - Some values may already be numeric (EMU)
+            """
+            try:
+                return float(obj.pt)
+            except Exception:
+                pass
+
+            try:
+                val = float(obj)
+                if val > 10000:
+                    return val / EMU_PER_POINT
+                return val
+            except Exception:
+                # Fallback
+                return 0.0
+
+        try:
+            section = doc.sections[0]
+            page_height_pt = _to_points_len(section.page_height)
+            top_margin_pt = _to_points_len(section.top_margin)
+            bottom_margin_pt = _to_points_len(section.bottom_margin)
+            printable_height = max(1.0, page_height_pt - (top_margin_pt + bottom_margin_pt))
+        except Exception:
+            printable_height = A4_HEIGHT_PT - (2 * DEFAULT_MARGIN_PT)
+
+        line_height = DEFAULT_FONT_SIZE_PT * LINE_HEIGHT_FACTOR
+        total_height_pt = 0.0
+        explicit_page_breaks = 0
+
+        for para in doc.paragraphs:
+            #Count manual page breaks in this paragraph
+            if _has_page_break(para):
+                explicit_page_breaks += 1
+
+            text = (para.text or "").strip()
+
+            if not text:
+                total_height_pt += line_height
+                continue
+
+            char_count = len(text)
+            wrapped_lines = max(1, math.ceil(char_count / AVG_CHARS_PER_LINE))
+            total_height_pt += wrapped_lines * line_height
+
+            # Add a bit of after-paragraph spacing
+            total_height_pt += PARA_SPACING_LINES * line_height
+
+        # 2) TABLES (count rows)
+        for table in doc.tables:
+            row_count = len(table.rows)
+            if row_count > 0:
+                total_height_pt += row_count * (TABLE_ROW_LINES * line_height)
+                total_height_pt += TABLE_AFTER_SPACING_LINES * line_height
+
+        # 3) IMAGES (inline shapes)
+        for shape in getattr(doc, "inline_shapes", []):
+            # Height in points
+            h_pt = _to_points_len(shape.height)
+            if h_pt <= 0:
+                # conservative fallback if height cannot be read
+                h_pt = 150.0
+            total_height_pt += h_pt + (0.5 * line_height)
+
+        try:
+            header = section.header
+            footer = section.footer
+            if header and header.paragraphs and any((p.text or "").strip() for p in header.paragraphs):
+                total_height_pt += HEADER_FOOTER_LINES * line_height
+            if footer and footer.paragraphs and any((p.text or "").strip() for p in footer.paragraphs):
+                total_height_pt += HEADER_FOOTER_LINES * line_height
+        except Exception:
+            pass
+
+        # 5) Convert accumulated height to pages
+        content_pages = math.ceil(max(1.0, total_height_pt) / printable_height)
+
+        # Add explicit manual page breaks (each forces a new page)
+        pages = content_pages + explicit_page_breaks
+
+        # Safety bound
+        return max(1, int(pages))
+
+    def estimate_excel_a4_pages(self, xl_bytes):
+        wb = load_workbook(BytesIO(xl_bytes), data_only=True)
+        printable_width = A4_WIDTH_PT - (2 * DEFAULT_MARGIN_PT)
+        printable_height = A4_HEIGHT_PT - (2 * DEFAULT_MARGIN_PT)
+
+        total_pages = 0
+
+        for sheet in wb.worksheets:
+            #detect actual used cell range
+            min_row = None
+            max_row = None
+            min_col = None
+            max_col = None
+
+            for row in sheet.iter_rows():
+                for cell in row:
+                    if cell.value not in (None, ""):
+                        r = cell.row
+                        c = cell.column
+
+                        min_row = r if min_row is None else min(min_row, r)
+                        max_row = r if max_row is None else max(max_row, r)
+                        min_col = c if min_col is None else min(min_col, c)
+                        max_col = c if max_col is None else max(max_col, c)
+
+            #If sheet empty → 1 page
+            if min_row is None:
+                total_pages += 1
+                continue
+
+            used_cols = max_col - min_col + 1
+            used_rows = max_row - min_row + 1
+
+            # Estimate dimensions
+            total_width = used_cols * 64      # approx 64pt per column
+            total_height = used_rows * 15     # approx 15pt per row
+
+            width_pages = math.ceil(total_width / printable_width)
+            height_pages = math.ceil(total_height / printable_height)
+
+            total_pages += max(1, width_pages * height_pages)
+
+        return total_pages
+    
+    def estimate_txt_a4_pages(self, file_bytes):
+        text = file_bytes.decode("utf-8", errors="ignore")
+        total_chars = len(text)
+
+        #printable area
+        printable_width = A4_WIDTH_PT - 2 * DEFAULT_MARGIN_PT
+        printable_height = A4_HEIGHT_PT - 2 * DEFAULT_MARGIN_PT
+
+        # Typography estimation
+        char_width = DEFAULT_FONT_SIZE_PT * 0.5
+        line_height = DEFAULT_FONT_SIZE_PT * LINE_HEIGHT_FACTOR
+
+        chars_per_line = printable_width / char_width
+        lines_per_page = printable_height / line_height
+
+        chars_per_page = chars_per_line * lines_per_page
+
+        estimated_pages = math.ceil(total_chars / chars_per_page)
+
+        return max(1, estimated_pages)
 
     def download_translated(self):
         translated_files = []
@@ -106,9 +337,8 @@ class Translator:
             else:
                 final_name = f"{target_language}_{cleaned}_translated"
 
-
-            # translated_files.append((blob.name, file_bytes))
             translated_files.append((final_name, file_bytes))
+            # translated_files.append((meta, file_bytes))
         return translated_files
 
     #blob lvl cleanup
@@ -129,7 +359,6 @@ class Translator:
 
 
 client = Translator()
-
 
 
 # --- LOGOS ---
@@ -174,8 +403,6 @@ st.markdown(
 )
 
 
-
-
 LOGO_URL = "https://th.bing.com/th/id/OIP.Wgr313SqtaL6NaKsDJfihQAAAA?o=7rm=3&rs=1&pid=ImgDetMain&o=7&rm=3"
 # One centered row
 left, mid, right = st.columns([1, 3, 1])
@@ -203,73 +430,6 @@ with mid:
         """,
         unsafe_allow_html=True
     )
-
-    # c_logo, c_title = st.columns([1, 4])
-    #
-    # with c_logo:
-    #     st.markdown(
-    #         """
-    #         <div style="
-    #             height: 88px;
-    #             display: flex;
-    #             align-items: flex-end;
-    #         ">
-    #             <img src="https://th.bing.com/th/id/OIP.Wgr313SqtaL6NaKsDJfihQAAAA?o=7rm=3&rs=1&pid=ImgDetMain&o=7&rm=3" width="88">
-    #         </div>
-    #         """,
-    #         unsafe_allow_html=True
-    #     )
-    #
-    # with c_title:
-    #     st.markdown(
-    #         """
-    #         <div style="
-    #             height: 88px;
-    #             display: flex;
-    #             align-items: flex-end;
-    #         ">
-    #             <h1 style="margin:0;">Doc-Translator</h1>
-    #         </div>
-    #         """,
-    #         unsafe_allow_html=True
-    #     )
-
-
-
-
-# uploaded_files = st.file_uploader(
-#     "Upload files",
-#     type=["pdf", "docx", "txt", "html", "xlsx"],
-#     accept_multiple_files=True
-# )
-#
-# target_language = st.text_input("Target language (ISO code)", value="en")
-#
-# if st.button("Translate") and uploaded_files:
-#     with st.spinner("Uploading files..."):
-#         uploaded_names = client.upload_files(uploaded_files)
-#
-#     st.success(f"Uploaded {len(uploaded_names)} file(s).")
-#     st.info("Starting translation...")
-#
-#     poller = client.translate(target_language)
-#
-#     with st.spinner("Translating..."):
-#         poller.result()
-#
-#     st.success("Translation completed!")
-#
-#     st.write(f"Documents succeeded: {poller.details.documents_succeeded_count}")
-#     st.write(f"Documents failed: {poller.details.documents_failed_count}")
-#
-#     translated = client.download_translated()
-#
-#     st.subheader("Download Translated Files")
-#     for fname, data in translated:
-#         st.download_button(f"Download {fname}", data, file_name=fname)
-#
-#     client.cleanup(uploaded_names)
-#     st.warning("Temporary files removed.")
 
 
 if "translated_files" not in st.session_state:
@@ -346,15 +506,78 @@ if translate_clicked and uploaded_files:
     with st.spinner("Uploading files..."):
         uploaded_names = client.upload_files(uploaded_files)
 
-    st.success(f"Uploaded {len(uploaded_names)} file(s).")
-    st.info("Starting translation...")
+    #####table insertion
+    row_keys = []
+
+    for f, blob_name in zip(uploaded_files, uploaded_names):
+        f.seek(0)
+        file_bytes = f.read()
+        filename = f.name.lower()
+        extension = "." + filename.split(".")[-1]
+        # print("lsdsdsdd",file_bytes)
+        page_count = client.page_count(file_bytes, extension)
+        # print("page______count", page_count, extension)
+        row_key = str(uuid.uuid4())
+        row_keys.append(row_key)
+
+        if client.table_client:
+            client.table_client.upsert_entity({
+                "PartitionKey": "files",
+                "RowKey": row_key,
+                "original_name": f.name,
+                "blob_name": blob_name,
+                "file_type": filename.split(".")[-1],
+                "target_language": target_language,
+                "page_count": page_count,
+                "status": "Uploaded",
+                "uploaded_on": datetime.now(timezone.utc).isoformat(),
+                "translated_on": ""
+            })
+
+    # st.success(f"Uploaded {len(uploaded_names)} file(s).")
 
     poller = client.translate(target_language)
+    progress_bar = st.progress(0)
+    status_placeholder = st.empty()
 
     with st.spinner("Translating..."):
+        while not poller.done():
+
+            try:
+                details = poller.details
+
+                if details and details.summary:
+                    total = details.summary.get("total", 0)
+                    succeeded = details.summary.get("succeeded", 0)
+                    failed = details.summary.get("failed", 0)
+                    completed = succeeded + failed
+
+                    if total > 0:
+                        progress = int((completed / total) * 100)
+                        progress_bar.progress(progress)
+
+                    status_placeholder.info(
+                        f"Processed {completed} of {total} documents..."
+                    )
+                else:
+                    status_placeholder.info("Initializing translation job...")
+
+            except:
+                status_placeholder.info("Preparing documents...")
+
+            time.sleep(2)
         poller.result()
 
-    st.success("Translation completed!")
+    progress_bar.progress(100)
+    status_placeholder.success("Translation completed successfully!")
+
+    for row_key in row_keys:
+        client.table_client.update_entity({
+            "PartitionKey": "files",
+            "RowKey": row_key,
+            "status": "Translated",
+            "translated_on": datetime.now(timezone.utc).isoformat()
+        }, mode=UpdateMode.MERGE)
 
     # Save stats in state so they persist across reruns
     st.session_state.translate_stats = {

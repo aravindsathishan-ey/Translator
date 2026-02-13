@@ -1,5 +1,11 @@
 streamlit
 python-dotenv
+Pillow
+python-docx
+PyPDF2
+openpyxl
+python-pptx
 azure-core
 azure-ai-translation-document
 azure-storage-blob
+azure-data-tables

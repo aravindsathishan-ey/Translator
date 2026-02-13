@@ -1,5 +1,3 @@
-# This is a Streamlit app that allows users to upload documents, translates them using Azure Document Translation, and then download the translated versions. It also tracks translation status in an Azure Table and estimates page counts for various document types.
-
 import os
 import uuid
 import math
@@ -29,18 +27,13 @@ ENDPOINT = os.getenv("AZURE_DOCUMENT_TRANSLATION_ENDPOINT")
 KEY = os.getenv("AZURE_DOCUMENT_TRANSLATION_KEY")
 TABLE_NAME = os.getenv("AZURE_TABLE_NAME", "learningtesttable")
 
-# DOC-CONFIG
+#DOC-CONFIG
 A4_WIDTH_PT = 595
 A4_HEIGHT_PT = 842
 DEFAULT_MARGIN_PT = 72
 DEFAULT_FONT_SIZE_PT = 12
-LINE_HEIGHT_FACTOR = 1.2
-AVG_CHARS_PER_LINE = 80          
-PARA_SPACING_LINES = 0.3         
-TABLE_ROW_LINES = 1    
-TABLE_AFTER_SPACING_LINES = 0.5
-HEADER_FOOTER_LINES = 1.0    
-EMU_PER_POINT = 12700
+LINE_HEIGHT_FACTOR = 1.2                  
+CHARS_PER_PAGE = 2000
 
 
 class Translator:
@@ -159,147 +152,43 @@ class Translator:
 
     
     def estimate_docx_a4_pages(self, docx_bytes):
-        """
-        Estimate DOCX pages (works with images, tables, paragraphs, manual page breaks).
-        Pure Python: uses height estimation rather than true layout.
-        """
         doc = Document(BytesIO(docx_bytes))
-        def _has_page_break(paragraph) -> bool:
-            """
-            Detects if a Word paragraph contains a manual page break:
-            looks for <w:br w:type="page"/> anywhere in the paragraph XML.
-            """
-            p = paragraph._element
-            br_elems = p.xpath('.//w:br[@w:type="page"]')
-            return len(br_elems) > 0
-        def _to_points_len(obj) -> float:
-            """
-            Convert python-docx length-like value to points (float) safely.
-            - python-docx Length objects have .pt
-            - Some values may already be numeric (EMU)
-            """
-            try:
-                return float(obj.pt)
-            except Exception:
-                pass
+        total_chars = 0
 
-            try:
-                val = float(obj)
-                if val > 10000:
-                    return val / EMU_PER_POINT
-                return val
-            except Exception:
-                # Fallback
-                return 0.0
-
-        try:
-            section = doc.sections[0]
-            page_height_pt = _to_points_len(section.page_height)
-            top_margin_pt = _to_points_len(section.top_margin)
-            bottom_margin_pt = _to_points_len(section.bottom_margin)
-            printable_height = max(1.0, page_height_pt - (top_margin_pt + bottom_margin_pt))
-        except Exception:
-            printable_height = A4_HEIGHT_PT - (2 * DEFAULT_MARGIN_PT)
-
-        line_height = DEFAULT_FONT_SIZE_PT * LINE_HEIGHT_FACTOR
-        total_height_pt = 0.0
-        explicit_page_breaks = 0
-
+        #para
         for para in doc.paragraphs:
-            #Count manual page breaks in this paragraph
-            if _has_page_break(para):
-                explicit_page_breaks += 1
+            if para.text.strip():
+                total_chars += len(para.text)
 
-            text = (para.text or "").strip()
-
-            if not text:
-                total_height_pt += line_height
-                continue
-
-            char_count = len(text)
-            wrapped_lines = max(1, math.ceil(char_count / AVG_CHARS_PER_LINE))
-            total_height_pt += wrapped_lines * line_height
-
-            # Add a bit of after-paragraph spacing
-            total_height_pt += PARA_SPACING_LINES * line_height
-
-        # 2) TABLES (count rows)
+        #table
         for table in doc.tables:
-            row_count = len(table.rows)
-            if row_count > 0:
-                total_height_pt += row_count * (TABLE_ROW_LINES * line_height)
-                total_height_pt += TABLE_AFTER_SPACING_LINES * line_height
+            for row in table.rows:
+                for cell in row.cells:
+                    if cell.text.strip():
+                        total_chars += len(cell.text)
 
-        # 3) IMAGES (inline shapes)
-        for shape in getattr(doc, "inline_shapes", []):
-            # Height in points
-            h_pt = _to_points_len(shape.height)
-            if h_pt <= 0:
-                # conservative fallback if height cannot be read
-                h_pt = 150.0
-            total_height_pt += h_pt + (0.5 * line_height)
-
-        try:
+        #header/footr
+        for section in doc.sections:
             header = section.header
             footer = section.footer
-            if header and header.paragraphs and any((p.text or "").strip() for p in header.paragraphs):
-                total_height_pt += HEADER_FOOTER_LINES * line_height
-            if footer and footer.paragraphs and any((p.text or "").strip() for p in footer.paragraphs):
-                total_height_pt += HEADER_FOOTER_LINES * line_height
-        except Exception:
-            pass
+            for para in header.paragraphs + footer.paragraphs:
+                if para.text.strip():
+                    total_chars += len(para.text)
 
-        # 5) Convert accumulated height to pages
-        content_pages = math.ceil(max(1.0, total_height_pt) / printable_height)
-
-        # Add explicit manual page breaks (each forces a new page)
-        pages = content_pages + explicit_page_breaks
-
-        # Safety bound
-        return max(1, int(pages))
+        pages = math.ceil(total_chars / CHARS_PER_PAGE)
+        return pages
 
     def estimate_excel_a4_pages(self, xl_bytes):
         wb = load_workbook(BytesIO(xl_bytes), data_only=True)
-        printable_width = A4_WIDTH_PT - (2 * DEFAULT_MARGIN_PT)
-        printable_height = A4_HEIGHT_PT - (2 * DEFAULT_MARGIN_PT)
-
-        total_pages = 0
+        total_chars = 0
 
         for sheet in wb.worksheets:
-            #detect actual used cell range
-            min_row = None
-            max_row = None
-            min_col = None
-            max_col = None
-
             for row in sheet.iter_rows():
                 for cell in row:
                     if cell.value not in (None, ""):
-                        r = cell.row
-                        c = cell.column
+                        total_chars += len(str(cell.value))
 
-                        min_row = r if min_row is None else min(min_row, r)
-                        max_row = r if max_row is None else max(max_row, r)
-                        min_col = c if min_col is None else min(min_col, c)
-                        max_col = c if max_col is None else max(max_col, c)
-
-            #If sheet empty → 1 page
-            if min_row is None:
-                total_pages += 1
-                continue
-
-            used_cols = max_col - min_col + 1
-            used_rows = max_row - min_row + 1
-
-            # Estimate dimensions
-            total_width = used_cols * 64      # approx 64pt per column
-            total_height = used_rows * 15     # approx 15pt per row
-
-            width_pages = math.ceil(total_width / printable_width)
-            height_pages = math.ceil(total_height / printable_height)
-
-            total_pages += max(1, width_pages * height_pages)
-
+        total_pages = math.ceil(total_chars / CHARS_PER_PAGE)
         return total_pages
     
     def estimate_txt_a4_pages(self, file_bytes):
@@ -361,6 +250,7 @@ class Translator:
 client = Translator()
 
 
+
 # --- LOGOS ---
 
 st.set_page_config(
@@ -401,6 +291,8 @@ st.markdown(
     """,
     unsafe_allow_html=True
 )
+
+
 
 
 LOGO_URL = "https://th.bing.com/th/id/OIP.Wgr313SqtaL6NaKsDJfihQAAAA?o=7rm=3&rs=1&pid=ImgDetMain&o=7&rm=3"

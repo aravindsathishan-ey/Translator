@@ -395,6 +395,8 @@ if translate_clicked and uploaded_files:
     with st.spinner("Uploading files..."):
         uploaded_names = client.upload_files(uploaded_files)
 
+    total_docs = len(uploaded_names)
+
     #####table insertion
     row_keys = []
 
@@ -451,7 +453,7 @@ if translate_clicked and uploaded_files:
                         progress_bar.progress(progress)
 
                     status_placeholder.info(
-                        f"Processed {completed} of {total} documents..."
+                        f"Processed {completed} of {total_docs} documents..."
                     )
                 else:
                     status_placeholder.info("Initializing translation job...")

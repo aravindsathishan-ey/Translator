@@ -334,7 +334,7 @@ if "uploaded_temp_refs" not in st.session_state:
 # --- UI controls ---
 uploaded_files = st.file_uploader(
     "Upload files",
-    type=["pdf", "docx", "txt", "html", "xlsx"],
+    type=["pdf", "docx", "txt", "html", "xlsx", "pptx"],
     accept_multiple_files=True,
     key="uploader"  # stable key helps retain value across reruns
 )
